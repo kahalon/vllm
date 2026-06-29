@@ -68,6 +68,7 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     # Keyed by scheduler-assigned job IDs.
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
+    store_jobs_to_flush_before_forward: set[int] | None = None
     jobs_to_flush: set[int] | None = None
 
 

@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     _TransferMetricName,
+    _WriteBackMetricName,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
@@ -56,12 +57,25 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Write-back store jobs to flush before forward can outlive their original
+    # request state, so they carry their own request context.
+    req_context: ReqContext | None = None
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
     non_sliding_window_block_ids: list[int] | None = None
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+
+
+@dataclass(slots=True)
+class DirtyBlockEntry:
+    dirty_id: int
+    key: OffloadKey
+    req_context: ReqContext
+    group_idx: int
+    src_block_ids: list[int]
+    block_index: int
 
 
 @dataclass(slots=True)
@@ -297,6 +311,12 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats: OffloadingConnectorStats | None = None
+        self.write_policy: str = spec.extra_config.get("write_policy", "write_through")
+        if self.write_policy not in ("write_through", "write_back"):
+            raise ValueError(
+                "write_policy must be 'write_through' or 'write_back', "
+                f"got {self.write_policy!r}"
+            )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -344,6 +364,12 @@ class OffloadingConnectorScheduler:
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
+        # write-back dirty block tracking.
+        self._dirty_counter: int = 0
+        self._dirty_blocks: dict[int, DirtyBlockEntry] = {}
+        self._block_id_to_dirty_ids: dict[int, set[int]] = {}
+        self._write_back_store_jobs_to_flush_before_forward: int = 0
+
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
@@ -356,8 +382,32 @@ class OffloadingConnectorScheduler:
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
+    def _add_dirty_block(self, entry: DirtyBlockEntry) -> None:
+        self._dirty_blocks[entry.dirty_id] = entry
+        for block_id in entry.src_block_ids:
+            self._block_id_to_dirty_ids.setdefault(block_id, set()).add(entry.dirty_id)
+
+    def _remove_dirty_block(self, dirty_id: int) -> DirtyBlockEntry | None:
+        entry = self._dirty_blocks.pop(dirty_id, None)
+        if entry is None:
+            return None
+        for block_id in entry.src_block_ids:
+            dirty_ids = self._block_id_to_dirty_ids.get(block_id)
+            if dirty_ids is None:
+                continue
+            dirty_ids.discard(dirty_id)
+            if not dirty_ids:
+                del self._block_id_to_dirty_ids[block_id]
+        return entry
+
+    def _make_dirty_req_context(self, req_context: ReqContext) -> ReqContext:
+        return ReqContext(
+            req_id=req_context.req_id,
+            kv_transfer_params=req_context.kv_transfer_params,
+        )
+
     def _build_store_gpu_spec(
-        self, items: Iterable[StoreCandidate]
+        self, items: Iterable[StoreCandidate | DirtyBlockEntry]
     ) -> GPULoadStoreSpec:
         group_sizes = [0] * len(self.config.kv_group_configs)
         block_indices = [0] * len(self.config.kv_group_configs)
@@ -462,6 +512,58 @@ class OffloadingConnectorScheduler:
                     block_index=block_index,
                     is_sliding_window=is_sliding_window,
                 )
+
+    def _build_write_back_store_jobs_to_flush_before_forward(
+        self,
+    ) -> dict[int, TransferJob]:
+        if not self._current_batch_allocated_block_ids:
+            return {}
+
+        dirty_ids = {
+            dirty_id
+            for block_id in self._current_batch_allocated_block_ids
+            for dirty_id in self._block_id_to_dirty_ids.get(block_id, ())
+        }
+        if not dirty_ids:
+            return {}
+
+        store_jobs_to_flush_before_forward: dict[int, TransferJob] = {}
+        for dirty_id in sorted(dirty_ids):
+            entry = self._remove_dirty_block(dirty_id)
+            if entry is None:
+                continue
+
+            store_output = self.manager.prepare_store([entry.key], entry.req_context)
+            if store_output is None:
+                raise RuntimeError(
+                    "write-back store job to flush before forward failed: "
+                    "offload backend cannot accept a dirty KV block before "
+                    "its GPU block is reused."
+                )
+            if entry.key not in set(store_output.keys_to_store):
+                continue
+
+            src_spec = self._build_store_gpu_spec((entry,))
+            dst_spec = store_output.store_spec
+
+            job_id = self._generate_job_id()
+
+            self._jobs[job_id] = TransferJobStatus(
+                req_id=entry.req_context.req_id,
+                pending_count=self.config.num_workers,
+                keys={entry.key},
+                is_store=True,
+                req_context=entry.req_context,
+            )
+            store_jobs_to_flush_before_forward[job_id] = TransferJob(
+                req_id=entry.req_context.req_id,
+                transfer_spec=(src_spec, dst_spec),
+            )
+
+        self._write_back_store_jobs_to_flush_before_forward += len(
+            store_jobs_to_flush_before_forward
+        )
+        return store_jobs_to_flush_before_forward
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -871,6 +973,28 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    def _record_write_back_dirty_blocks(
+        self,
+        req_status: RequestOffloadState,
+        num_offloadable_tokens: int,
+        candidates: Sequence[StoreCandidate],
+    ) -> None:
+        for candidate in candidates:
+            dirty_id = self._dirty_counter
+            self._dirty_counter += 1
+            self._add_dirty_block(
+                DirtyBlockEntry(
+                    dirty_id=dirty_id,
+                    key=candidate.key,
+                    req_context=self._make_dirty_req_context(req_status.req_context),
+                    group_idx=candidate.group_idx,
+                    src_block_ids=candidate.src_block_ids,
+                    block_index=candidate.block_index,
+                )
+            )
+
+        req_status.advance_stored_idx(num_offloadable_tokens)
+
     def _build_write_through_store_job(
         self,
         req_id: ReqId,
@@ -969,6 +1093,13 @@ class OffloadingConnectorScheduler:
             candidates = list(
                 self._iter_store_candidates(req_status, num_offloadable_tokens)
             )
+
+            if self.write_policy == "write_back":
+                self._record_write_back_dirty_blocks(
+                    req_status, num_offloadable_tokens, candidates
+                )
+                continue
+
             job = self._build_write_through_store_job(
                 req_id, req_status, num_offloadable_tokens, candidates
             )
@@ -1015,9 +1146,24 @@ class OffloadingConnectorScheduler:
         ):
             self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
+        if self.write_policy == "write_back":
+            store_jobs_to_flush_before_forward = (
+                self._build_write_back_store_jobs_to_flush_before_forward()
+            )
+            store_jobs = {
+                **store_jobs_to_flush_before_forward,
+                **self._build_store_jobs(scheduler_output),
+            }
+        else:
+            store_jobs_to_flush_before_forward = {}
+            store_jobs = self._build_store_jobs(scheduler_output)
+
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=self._build_store_jobs(scheduler_output),
+            store_jobs=store_jobs,
+            store_jobs_to_flush_before_forward=set(
+                store_jobs_to_flush_before_forward.keys()
+            ),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
         self._current_batch_load_jobs = {}
@@ -1085,6 +1231,14 @@ class OffloadingConnectorScheduler:
                 continue
             assert job_status.pending_count == 0
 
+            # Detached write-back job.
+            if job_status.is_store and job_status.req_context is not None:
+                self.manager.complete_store(job_status.keys, job_status.req_context)
+                del self._jobs[job_id]
+                continue
+
+            # From here on, all jobs are regular store/load jobs.
+            assert job_status.req_context is None
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
@@ -1111,6 +1265,25 @@ class OffloadingConnectorScheduler:
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = self._connector_stats
         self._connector_stats = None
+
+        if self.write_policy == "write_back":
+            write_back_stats = OffloadingConnectorStats()
+            store_jobs_to_flush_before_forward = (
+                self._write_back_store_jobs_to_flush_before_forward
+            )
+            if store_jobs_to_flush_before_forward:
+                write_back_stats.increase_counter(
+                    _WriteBackMetricName.STORE_JOBS_TO_FLUSH_BEFORE_FORWARD,
+                    store_jobs_to_flush_before_forward,
+                )
+                self._write_back_store_jobs_to_flush_before_forward = 0
+            write_back_stats.set_gauge(
+                _WriteBackMetricName.DIRTY_BLOCKS, len(self._dirty_blocks)
+            )
+            if stats is None:
+                stats = write_back_stats
+            else:
+                stats.aggregate(write_back_stats)
 
         manager_stats = self.manager.get_stats()
         if manager_stats is not None:
@@ -1201,6 +1374,8 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._dirty_blocks.clear()
+        self._block_id_to_dirty_ids.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.

@@ -30,6 +30,15 @@ class _TransferMetricName:
     STORE_SIZE = "vllm:kv_offload_store_size"
 
 
+class _WriteBackMetricName:
+    """Metric names for write-back offload scheduler state."""
+
+    STORE_JOBS_TO_FLUSH_BEFORE_FORWARD = (
+        "vllm:kv_offload_write_back_store_jobs_to_flush_before_forward"
+    )
+    DIRTY_BLOCKS = "vllm:kv_offload_write_back_dirty_blocks"
+
+
 class _TransferType:
     """Transfer direction labels for deprecated CPU offload metrics."""
 
@@ -73,6 +82,16 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload store operation size, in bytes.",
             buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _WriteBackMetricName.STORE_JOBS_TO_FLUSH_BEFORE_FORWARD: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Total write-back KV offload store jobs flushed before forward."
+                ),
+            )
+        ),
+        _WriteBackMetricName.DIRTY_BLOCKS: OffloadingGaugeMetadata(
+            documentation="Current dirty GPU KV blocks tracked for write-back.",
         ),
     }
 

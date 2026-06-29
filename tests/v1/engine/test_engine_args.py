@@ -64,6 +64,22 @@ def test_prefix_caching_xxhash_from_cli():
     assert vllm_config.cache_config.prefix_caching_hash_algo == "xxhash_cbor"
 
 
+def test_kv_offloading_policy_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.kv_offloading_policy == "write_through"
+
+    args = parser.parse_args(["--kv-offloading-policy", "write_back"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.kv_offloading_policy == "write_back"
+
+    parser.exit_on_error = False
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--kv-offloading-policy", "invalid"])
+
+
 def test_defaults_with_usage_context():
     engine_args = EngineArgs(model="facebook/opt-125m")
     vllm_config: VllmConfig = engine_args.create_engine_config(UsageContext.LLM_CLASS)

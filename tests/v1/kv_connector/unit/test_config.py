@@ -5,7 +5,13 @@
 
 import pytest
 
-from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVTransferConfig,
+    ParallelConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 pytestmark = pytest.mark.cpu_test
@@ -181,3 +187,73 @@ def test_kv_offloading_size_only_uses_native_default():
     assert kv_transfer_config.kv_connector == "OffloadingConnector"
     assert kv_transfer_config.kv_role == "kv_both"
     assert kv_connector_extra_config["cpu_bytes_to_use"] == 4.0 * (1 << 30)
+
+
+def test_kv_offloading_policy_defaults_to_write_through():
+    assert CacheConfig().kv_offloading_policy == "write_through"
+
+
+def test_kv_offloading_write_back_native_propagates_write_policy():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(
+            kv_offloading_size=4.0,
+            kv_offloading_policy="write_back",
+        ),
+        device_config=DeviceConfig(device="cpu"),
+    )
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    kv_connector_extra_config = kv_transfer_config.kv_connector_extra_config
+
+    assert kv_transfer_config.kv_connector == "OffloadingConnector"
+    assert kv_connector_extra_config["write_policy"] == "write_back"
+
+
+def test_kv_offloading_write_back_rejects_lmcache(stub_lmcache_mp_connector):
+    with pytest.raises(ValueError, match="write_back.*native OffloadingConnector"):
+        VllmConfig(
+            cache_config=CacheConfig(
+                kv_offloading_backend="lmcache",
+                kv_offloading_size=4.0,
+                kv_offloading_policy="write_back",
+            ),
+            device_config=DeviceConfig(device="cpu"),
+        )
+
+
+def test_kv_offloading_write_back_rejects_simple_offload(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "1")
+    with pytest.raises(ValueError, match="write_back.*native OffloadingConnector"):
+        VllmConfig(
+            cache_config=CacheConfig(
+                kv_offloading_size=4.0,
+                kv_offloading_policy="write_back",
+            ),
+            device_config=DeviceConfig(device="cpu"),
+        )
+
+
+def test_kv_offloading_write_back_rejects_disabled_prefix_caching():
+    with pytest.raises(ValueError, match="write_back.*prefix caching"):
+        VllmConfig(
+            cache_config=CacheConfig(
+                enable_prefix_caching=False,
+                kv_offloading_size=4.0,
+                kv_offloading_policy="write_back",
+            ),
+            device_config=DeviceConfig(device="cpu"),
+        )
+
+
+def test_kv_offloading_write_back_rejects_store_threshold_filter():
+    with pytest.raises(ValueError, match="write_back.*store_threshold"):
+        VllmConfig(
+            cache_config=CacheConfig(
+                kv_offloading_size=4.0,
+                kv_offloading_policy="write_back",
+            ),
+            device_config=DeviceConfig(device="cpu"),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector_extra_config={"store_threshold": 2}
+            ),
+        )
