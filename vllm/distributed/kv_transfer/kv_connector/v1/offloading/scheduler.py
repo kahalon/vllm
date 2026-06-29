@@ -64,6 +64,15 @@ class TransferJobStatus:
     sliding_window_block_ids: list[int] | None = None
 
 
+@dataclass(slots=True)
+class StoreCandidate:
+    key: OffloadKey
+    group_idx: int
+    src_block_ids: list[int]
+    block_index: int
+    is_sliding_window: bool
+
+
 class GroupOffloadConfig(NamedTuple):
     group_idx: int
     gpu_block_size: int
@@ -346,6 +355,113 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    def _build_store_gpu_spec(
+        self, items: Iterable[StoreCandidate]
+    ) -> GPULoadStoreSpec:
+        group_sizes = [0] * len(self.config.kv_group_configs)
+        block_indices = [0] * len(self.config.kv_group_configs)
+        src_block_ids: list[int] = []
+        for item in items:
+            group_idx = item.group_idx
+            if group_sizes[group_idx] == 0:
+                block_indices[group_idx] = item.block_index
+            group_sizes[group_idx] += len(item.src_block_ids)
+            src_block_ids.extend(item.src_block_ids)
+        return GPULoadStoreSpec(
+            src_block_ids,
+            group_sizes=group_sizes,
+            block_indices=block_indices,
+        )
+
+    def _get_num_offloadable_tokens(
+        self, req_status: RequestOffloadState, num_scheduled_tokens: int
+    ) -> int:
+        req = req_status.req
+        num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
+        # with async scheduling, some tokens may be missing
+        num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
+        max_offload_tokens = req_status.max_offload_tokens
+        if max_offload_tokens is not None:
+            num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
+
+        # Clamp to the prompt length so decode blocks are never queued in this
+        # or any later step when prompt-only offloading is enabled.
+        if self.config.offload_prompt_only:
+            num_offloadable_tokens = min(num_offloadable_tokens, req.num_prompt_tokens)
+
+        return num_offloadable_tokens
+
+    def _iter_store_candidates(
+        self,
+        req_status: RequestOffloadState,
+        num_offloadable_tokens: int,
+    ) -> Iterable[StoreCandidate]:
+        """Yield newly offloadable blocks after common store filters."""
+        block_size_factor = self.config.block_size_factor
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+            start_block_idx = group_state.next_stored_block_idx
+            if num_blocks <= start_block_idx:
+                continue
+
+            offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
+            # For each block to offload, take the last corresponding GPU block.
+            # e.g. if block size factor is 3 and GPU block IDs are
+            # 1 5 6 7 2 4 9 3 8 then we'll take blocks 6 4 8.
+            # A block_id of 0 means either a sliding window / SSM skip
+            # or a stale entry that was zeroed out — skip it either way.
+            block_id_start = start_block_idx * block_size_factor + block_size_factor - 1
+            block_id_end = num_blocks * block_size_factor
+            offload_block_ids = group_state.block_ids[
+                block_id_start:block_id_end:block_size_factor
+            ]
+            assert len(offload_keys) == len(offload_block_ids)
+
+            alignment_block_count = group_config.alignment_block_count
+            tail = group_config.sliding_window_size_in_blocks
+            is_sliding_window = tail is not None
+            block_ids = group_state.block_ids
+            for key_idx, (offload_key, block_id) in enumerate(
+                zip(offload_keys, offload_block_ids)
+            ):
+                if block_id == 0:
+                    continue
+                # Skip SWA blocks that can never serve a load hit:
+                # within each full-attention alignment segment, only the
+                # trailing `tail` blocks are reachable by
+                # _sliding_window_lookup. For DeepSeek V4 with 100K
+                # tokens this reduces SWA stores by ~78%.
+                if alignment_block_count is not None:
+                    assert tail is not None
+                    abs_block_idx = start_block_idx + key_idx
+                    pos_in_segment = abs_block_idx % alignment_block_count
+                    if pos_in_segment < alignment_block_count - tail:
+                        continue
+
+                offloaded_block_idx = start_block_idx + key_idx
+                gpu_block_idx = offloaded_block_idx * block_size_factor
+                src_block_ids: list[int] = []
+                block_index = 0
+                for i in range(block_size_factor):
+                    src_block_id = block_ids[gpu_block_idx + i]
+                    if src_block_id == 0:
+                        continue
+                    if not src_block_ids:
+                        block_index = gpu_block_idx + i
+                    src_block_ids.append(src_block_id)
+                if not src_block_ids:
+                    continue
+
+                yield StoreCandidate(
+                    key=offload_key,
+                    group_idx=group_config.group_idx,
+                    src_block_ids=src_block_ids,
+                    block_index=block_index,
+                    is_sliding_window=is_sliding_window,
+                )
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -755,178 +871,110 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    def _build_store_job(
+        self,
+        req_id: ReqId,
+        req_status: RequestOffloadState,
+        num_offloadable_tokens: int,
+        candidates: Sequence[StoreCandidate],
+    ) -> tuple[int, TransferJob] | None:
+        new_offload_keys = [candidate.key for candidate in candidates]
+
+        if not new_offload_keys:
+            req_status.advance_stored_idx(num_offloadable_tokens)
+            return None
+
+        store_output = self.manager.prepare_store(
+            new_offload_keys, req_status.req_context
+        )
+        if store_output is None:
+            logger.warning("Request %s: cannot store blocks", req_id)
+            return None
+
+        if not store_output.keys_to_store:
+            req_status.advance_stored_idx(num_offloadable_tokens)
+            return None
+
+        self._touch(req_status)
+
+        keys_to_store = set(store_output.keys_to_store)
+
+        candidates_to_store: list[StoreCandidate] = []
+        sliding_window_block_ids: list[int] = []
+        non_sliding_window_block_ids: list[int] = []
+        for candidate in candidates:
+            if candidate.key not in keys_to_store:
+                continue
+
+            candidates_to_store.append(candidate)
+            if candidate.is_sliding_window:
+                sliding_window_block_ids.extend(candidate.src_block_ids)
+            else:
+                non_sliding_window_block_ids.extend(candidate.src_block_ids)
+
+        req_status.advance_stored_idx(num_offloadable_tokens)
+
+        src_spec = self._build_store_gpu_spec(candidates_to_store)
+        dst_spec = store_output.store_spec
+
+        job_id = self._generate_job_id()
+        # a store can only be issued when no load is pending.
+        if req_status.transfer_jobs:
+            any_jid = next(iter(req_status.transfer_jobs))
+            assert self._jobs[any_jid].is_store
+        req_status.transfer_jobs.add(job_id)
+
+        # Watch sliding window blocks as they may get evicted
+        # before the request finishes
+        for bid in sliding_window_block_ids or ():
+            self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+
+        # the non-sliding window blocks will be watched only
+        # when the request finishes
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req_id,
+            pending_count=self.config.num_workers,
+            keys=set(keys_to_store),
+            is_store=True,
+            non_sliding_window_block_ids=non_sliding_window_block_ids,
+            sliding_window_block_ids=sliding_window_block_ids or None,
+        )
+
+        transfer_job = TransferJob(req_id=req_id, transfer_spec=(src_spec, dst_spec))
+
+        logger.debug(
+            "Request %s offloading %s blocks upto %d tokens (job %d)",
+            req_id,
+            len(keys_to_store),
+            num_offloadable_tokens,
+            job_id,
+        )
+
+        return job_id, transfer_job
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
-        block_size_factor = self.config.block_size_factor
         store_jobs: dict[int, TransferJob] = {}
         for req_id in scheduler_output.num_scheduled_tokens:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            req = req_status.req
 
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
-            # with async scheduling, some tokens may be missing
-            num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
-            max_offload_tokens = req_status.max_offload_tokens
-            if max_offload_tokens is not None:
-                num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
-
-            # Skip decode-phase blocks: clamp to the prompt length so only
-            # prefill (prompt) blocks become eligible for store. next_stored_idx
-            # never advances past this boundary, so decode blocks are never
-            # queued in this or any later step.
-            if self.config.offload_prompt_only:
-                num_offloadable_tokens = min(
-                    num_offloadable_tokens, req.num_prompt_tokens
-                )
-
-            # Filter out blocks skipped due to sliding window attention / SSM
-            # or unreachable by the load path's alignment constraints.
-            new_offload_keys: list[OffloadKey] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
-                start_block_idx = group_state.next_stored_block_idx
-                if num_blocks <= start_block_idx:
-                    continue
-                offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
-                # For each block to offload, take the last corresponding GPU block.
-                # e.g. if block size factor is 3 and GPU block IDs are
-                # 1 5 6 7 2 4 9 3 8 then we'll take blocks 6 4 8.
-                # A block_id of 0 means either a sliding window / SSM skip
-                # or a stale entry that was zeroed out — skip it either way.
-                offload_block_ids = group_state.block_ids[
-                    start_block_idx * block_size_factor
-                    + block_size_factor
-                    - 1 : num_blocks * block_size_factor : block_size_factor
-                ]
-                assert len(offload_keys) == len(offload_block_ids)
-
-                alignment_block_count = group_config.alignment_block_count
-                tail = group_config.sliding_window_size_in_blocks
-
-                for key_idx, (offload_key, block_id) in enumerate(
-                    zip(offload_keys, offload_block_ids)
-                ):
-                    if block_id == 0:
-                        continue
-                    # Skip SWA blocks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_block_count is not None:
-                        assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
-                            continue
-                    new_offload_keys.append(offload_key)
-
-            if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
-                continue
-
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
+            num_offloadable_tokens = self._get_num_offloadable_tokens(
+                req_status, num_scheduled_tokens
             )
-            if store_output is None:
-                logger.warning("Request %s: cannot store blocks", req_id)
-                continue
-
-            if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
-                continue
-
-            self._touch(req_status)
-
-            keys_to_store = set(store_output.keys_to_store)
-
-            group_sizes: list[int] = []
-            block_indices: list[int] = []
-            src_block_ids: list[int] = []
-            sliding_window_block_ids: list[int] = []
-            non_sliding_window_block_ids: list[int] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
-                is_sliding_window = (
-                    group_config.sliding_window_size_in_blocks is not None
-                )
-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
-                start_block_idx = group_state.next_stored_block_idx
-                block_ids = group_state.block_ids
-                num_group_blocks = 0
-                start_gpu_block_idx: int | None = None
-                for idx, offload_key in enumerate(
-                    group_state.offload_keys[start_block_idx:num_blocks]
-                ):
-                    if offload_key not in keys_to_store:
-                        continue
-
-                    offloaded_block_idx = start_block_idx + idx
-                    gpu_block_idx = offloaded_block_idx * block_size_factor
-                    for i in range(block_size_factor):
-                        block_id = block_ids[gpu_block_idx + i]
-                        if block_id == 0:
-                            continue
-                        if start_gpu_block_idx is None:
-                            start_gpu_block_idx = gpu_block_idx + i
-                        src_block_ids.append(block_id)
-                        num_group_blocks += 1
-                        if is_sliding_window:
-                            sliding_window_block_ids.append(block_id)
-                        else:
-                            non_sliding_window_block_ids.append(block_id)
-
-                group_sizes.append(num_group_blocks)
-                block_indices.append(start_gpu_block_idx or 0)
-                group_state.next_stored_block_idx = num_blocks
-
-            src_spec = GPULoadStoreSpec(
-                src_block_ids, group_sizes=group_sizes, block_indices=block_indices
+            candidates = list(
+                self._iter_store_candidates(req_status, num_offloadable_tokens)
             )
-            dst_spec = store_output.store_spec
-
-            job_id = self._generate_job_id()
-            # a store can only be issued when no load is pending.
-            if req_status.transfer_jobs:
-                any_jid = next(iter(req_status.transfer_jobs))
-                assert self._jobs[any_jid].is_store
-            req_status.transfer_jobs.add(job_id)
-
-            # Watch sliding window blocks as they may get evicted
-            # before the request finishes
-            for bid in sliding_window_block_ids or ():
-                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-
-            # the non-sliding window blocks will be watched only
-            # when the request finishes
-            self._jobs[job_id] = TransferJobStatus(
-                req_id=req_id,
-                pending_count=self.config.num_workers,
-                keys=set(keys_to_store),
-                is_store=True,
-                non_sliding_window_block_ids=non_sliding_window_block_ids,
-                sliding_window_block_ids=sliding_window_block_ids or None,
+            job = self._build_store_job(
+                req_id, req_status, num_offloadable_tokens, candidates
             )
-
-            store_jobs[job_id] = TransferJob(
-                req_id=req_id, transfer_spec=(src_spec, dst_spec)
-            )
-
-            logger.debug(
-                "Request %s offloading %s blocks upto %d tokens (job %d)",
-                req_id,
-                len(keys_to_store),
-                num_offloadable_tokens,
-                job_id,
-            )
+            if job is not None:
+                job_id, transfer_job = job
+                store_jobs[job_id] = transfer_job
 
         return store_jobs
 
