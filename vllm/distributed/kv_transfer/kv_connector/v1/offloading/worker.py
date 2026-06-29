@@ -223,6 +223,13 @@ class OffloadingConnectorWorker:
         self._register_handlers(canonical_kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
+        if job_ids := kv_connector_metadata.store_jobs_to_flush_before_forward:
+            for job_id in sorted(job_ids):
+                entry = kv_connector_metadata.store_jobs[job_id]
+                success = self.worker.transfer_async(job_id, entry.transfer_spec)
+                assert success
+            self.worker.wait(job_ids)
+
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
             success = self.worker.transfer_async(job_id, transfer_spec)
             assert success
@@ -243,7 +250,10 @@ class OffloadingConnectorWorker:
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
+        job_ids_to_skip = metadata.store_jobs_to_flush_before_forward
         for job_id, entry in metadata.store_jobs.items():
+            if job_ids_to_skip and job_id in job_ids_to_skip:
+                continue
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
             # to token sampling, thereby avoiding delays to token generation.

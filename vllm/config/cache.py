@@ -37,6 +37,7 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+KVOffloadingPolicy = Literal["write_through", "write_back"]
 
 
 @config
@@ -184,6 +185,12 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_offloading_policy: KVOffloadingPolicy = "write_through"
+    """The write policy for KV cache offloading. 'write_through' stores
+    eligible blocks as they are produced. 'write_back' tracks eligible GPU
+    blocks as dirty and stores them only before their GPU block IDs are reused.
+    KV offloading is only activated when kv_offloading_size is set."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -216,6 +223,8 @@ class CacheConfig:
             "kv_cache_max_concurrency",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # KV offload runtime policy does not affect compiled graph shape
+            "kv_offloading_policy",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

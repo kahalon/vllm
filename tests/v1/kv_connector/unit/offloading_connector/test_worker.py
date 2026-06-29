@@ -6,6 +6,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tests.v1.kv_connector.unit.offloading_connector.utils import MockLoadStoreSpec
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    TransferJob,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -22,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
+    GPULoadStoreSpec,
     OffloadingSpec,
 )
 
@@ -104,6 +110,45 @@ def _make_worker(kv_cache_config: KVCacheConfig):
     worker.worker = MagicMock()
 
     return worker, spec
+
+
+def test_handle_preemptions_submits_and_waits_store_jobs_to_flush_before_forward():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+
+    spec = MagicMock(spec=OffloadingSpec)
+    worker = OffloadingConnectorWorker(spec=spec)
+    worker.worker = MagicMock()
+    worker.worker.transfer_async.return_value = True
+
+    transfer_spec = (
+        GPULoadStoreSpec([7], group_sizes=[1], block_indices=[0]),
+        MockLoadStoreSpec([]),
+    )
+    deferred_transfer_spec = (
+        GPULoadStoreSpec([8], group_sizes=[1], block_indices=[0]),
+        MockLoadStoreSpec([]),
+    )
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={
+            123: TransferJob(req_id="write-back:7", transfer_spec=transfer_spec),
+            456: TransferJob(
+                req_id="write-through:8",
+                transfer_spec=deferred_transfer_spec,
+            ),
+        },
+        store_jobs_to_flush_before_forward={123},
+    )
+
+    worker.handle_preemptions(metadata)
+
+    worker.worker.transfer_async.assert_called_once_with(123, transfer_spec)
+    worker.worker.wait.assert_called_once_with({123})
+
+    worker.prepare_store_kv(metadata)
+    assert worker._unsubmitted_store_jobs == [(456, deferred_transfer_spec)]
 
 
 # ---------------------------------------------------------------------------

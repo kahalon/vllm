@@ -804,7 +804,10 @@ class VllmConfig:
                 config_connector = "OffloadingConnector"
             self.kv_transfer_config.kv_connector = config_connector
             self.kv_transfer_config.kv_connector_extra_config.update(
-                {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
+                {
+                    "cpu_bytes_to_use": kv_offloading_size * (1 << 30),
+                    "write_policy": self.cache_config.kv_offloading_policy,
+                }
             )
         elif kv_offloading_backend == "lmcache":
             # Default to LMCache multi-process (MP) mode. The actual KV
@@ -816,6 +819,37 @@ class VllmConfig:
 
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
+
+    def _verify_kv_offloading_policy_compat(self) -> None:
+        kv_transfer_config = self.kv_transfer_config
+        if kv_transfer_config is None or kv_transfer_config.kv_connector is None:
+            return
+
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        write_policy = extra_config.get(
+            "write_policy", self.cache_config.kv_offloading_policy
+        )
+        if write_policy not in ("write_through", "write_back"):
+            raise ValueError(
+                "kv offloading write_policy must be 'write_through' or "
+                f"'write_back', got {write_policy!r}"
+            )
+        if write_policy != "write_back":
+            return
+
+        connector = kv_transfer_config.kv_connector
+        if connector != "OffloadingConnector":
+            raise ValueError(
+                "write_back KV offloading policy is only supported with "
+                f"native OffloadingConnector, got {connector!r}."
+            )
+        if not self.cache_config.enable_prefix_caching:
+            raise ValueError("write_back KV offloading policy requires prefix caching.")
+        if int(extra_config.get("store_threshold", 0)) >= 2:
+            raise ValueError(
+                "write_back KV offloading policy is not supported with "
+                "store_threshold >= 2."
+            )
 
     def _verify_kv_transfer_compat(self) -> None:
         """Reject configurations that silently corrupt KV transfers."""
@@ -1459,6 +1493,7 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        self._verify_kv_offloading_policy_compat()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime

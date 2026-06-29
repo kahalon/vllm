@@ -33,6 +33,10 @@ STORE_SIZE = _TransferMetricName.STORE_SIZE
 STORES_SKIPPED = "vllm:kv_offload_stores_skipped"
 PENDING_STORES = "vllm:kv_offload_pending_stores"
 LOOKUP_LATENCY = "vllm:kv_offload_lookup_latency_seconds"
+WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD = (
+    "vllm:kv_offload_write_back_store_jobs_to_flush_before_forward"
+)
+WRITE_BACK_DIRTY_BLOCKS = "vllm:kv_offload_write_back_dirty_blocks"
 
 
 class _FakeMetric:
@@ -428,6 +432,49 @@ def test_prom_metrics_observes_manager_gauge_and_histogram():
     assert histogram.observed == [0.2, 0.4]
     histogram_def = prom_metrics._offloading_metric_defs[LOOKUP_LATENCY]
     assert histogram_def.kwargs["buckets"] == (0.1, 1.0)
+
+
+def test_prom_metrics_observes_write_back_metrics():
+    prom_metrics = OffloadPromMetrics(
+        vllm_config=_FakeVllmConfig(store_threshold=0),  # type: ignore[arg-type]
+        metric_types={
+            Gauge: _FakeMetric,
+            Counter: _FakeMetric,
+            Histogram: _FakeMetric,
+        },
+        labelnames=["model_name", "engine"],
+        per_engine_labelvalues={0: ["model", "0"]},
+    )
+
+    prom_metrics.observe(
+        {
+            _StatsKey.TYPES: {
+                WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD: _MetricType.COUNTER,
+                WRITE_BACK_DIRTY_BLOCKS: _MetricType.GAUGE,
+            },
+            _StatsKey.DATA: {
+                WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD: 3,
+                WRITE_BACK_DIRTY_BLOCKS: 5,
+            },
+        }
+    )
+
+    store_jobs_to_flush_before_forward = prom_metrics.offloading_metrics[
+        (0, WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD)
+    ]
+    dirty = prom_metrics.offloading_metrics[(0, WRITE_BACK_DIRTY_BLOCKS)]
+    assert store_jobs_to_flush_before_forward.increments == [3]
+    assert dirty.set_values == [5]
+    assert (
+        prom_metrics._offloading_metric_defs[
+            WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD
+        ].kwargs["name"]
+        == WRITE_BACK_STORE_JOBS_TO_FLUSH_BEFORE_FORWARD
+    )
+    assert (
+        prom_metrics._offloading_metric_defs[WRITE_BACK_DIRTY_BLOCKS].kwargs["name"]
+        == WRITE_BACK_DIRTY_BLOCKS
+    )
 
 
 def test_prom_metrics_uses_configured_manager_metrics():

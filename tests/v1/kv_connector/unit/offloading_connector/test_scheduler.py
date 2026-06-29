@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,12 +14,17 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingWorkerMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     SlidingWindowSpec,
 )
@@ -29,6 +36,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     get_offload_block_hash,
 )
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 
@@ -635,6 +643,238 @@ def _make_scheduler_with_lookup(
 
 
 _EMPTY_REQ_CTX = ReqContext(req_id="")
+
+
+class _FakeRequest:
+    def __init__(
+        self,
+        request_id: str = "req0",
+        num_tokens: int = 4,
+        num_computed_tokens: int = 0,
+    ):
+        self.request_id = request_id
+        self.kv_transfer_params: dict[str, Any] | None = None
+        self.num_tokens = num_tokens
+        self.num_computed_tokens = num_computed_tokens
+        self.num_prompt_tokens = num_tokens
+        self.block_hashes = [str(i).encode() for i in range(num_tokens)]
+        self.skip_reading_prefix_cache = False
+        self.finished = False
+
+    def is_finished(self) -> bool:
+        return self.finished
+
+
+def _make_write_back_scheduler(
+    *,
+    write_policy: str = "write_back",
+    prepare_store_output=None,
+    block_size_factor: int = 1,
+    block_ids: list[int] | None = None,
+) -> tuple[OffloadingConnectorScheduler, MagicMock, _FakeRequest]:
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+
+    manager = MagicMock(spec=OffloadingManager)
+    if prepare_store_output is None:
+        manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+    else:
+        manager.prepare_store.return_value = prepare_store_output
+    manager.on_new_request.return_value = RequestOffloadingContext()
+    manager.get_stats.return_value = None
+
+    spec = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=1),
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+        ),
+        kv_cache_config=kv_cache_config,
+        gpu_block_size=(block_size,),
+        hash_block_size=block_size,
+        block_size_factor=block_size_factor,
+        offload_prompt_only=False,
+        extra_config={"write_policy": write_policy},
+        get_manager=lambda: manager,
+    )
+
+    scheduler = OffloadingConnectorScheduler(spec)  # type: ignore[arg-type]
+    request = _FakeRequest(num_tokens=block_size * block_size_factor)
+    scheduler.on_new_request(request)  # type: ignore[arg-type]
+    req_status = scheduler._req_status[request.request_id]
+    req_status.update_offload_keys()
+    req_status.group_states[0].block_ids = block_ids or [11]
+    return scheduler, manager, request
+
+
+def _scheduled_output(req_id: str, num_tokens: int) -> SchedulerOutput:
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {req_id: num_tokens}
+    output.total_num_scheduled_tokens = num_tokens
+    return output
+
+
+def _extract_stats(stats):
+    assert stats is not None
+    return stats.data["data"]
+
+
+def test_write_back_records_dirty_blocks_instead_of_store_jobs():
+    scheduler, manager, request = _make_write_back_scheduler()
+
+    meta = scheduler.build_connector_meta(
+        _scheduled_output(request.request_id, request.num_tokens)
+    )
+
+    assert meta.store_jobs == {}
+    assert meta.store_jobs_to_flush_before_forward == set()
+    manager.prepare_store.assert_not_called()
+    values = _extract_stats(scheduler.get_stats())
+    assert values["vllm:kv_offload_write_back_dirty_blocks"] == 1
+
+
+def test_write_through_still_emits_deferred_store_jobs():
+    scheduler, manager, request = _make_write_back_scheduler(
+        write_policy="write_through"
+    )
+
+    meta = scheduler.build_connector_meta(
+        _scheduled_output(request.request_id, request.num_tokens)
+    )
+
+    assert len(meta.store_jobs) == 1
+    assert meta.store_jobs_to_flush_before_forward == set()
+    manager.prepare_store.assert_called_once()
+
+
+def test_write_back_reused_dirty_blocks_emit_store_jobs_to_flush_before_forward():
+    scheduler, manager, request = _make_write_back_scheduler()
+    scheduler.build_connector_meta(_scheduled_output(request.request_id, 4))
+
+    scheduler._current_batch_allocated_block_ids.add(11)
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+    assert len(meta.store_jobs) == 1
+    assert len(meta.store_jobs_to_flush_before_forward) == 1
+    manager.prepare_store.assert_called_once()
+
+    job_id = next(iter(meta.store_jobs_to_flush_before_forward))
+    assert job_id in meta.store_jobs
+    del scheduler._req_status[request.request_id]
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    manager.complete_store.assert_called_once()
+    values = _extract_stats(scheduler.get_stats())
+    assert values["vllm:kv_offload_write_back_store_jobs_to_flush_before_forward"] == 1
+    assert values["vllm:kv_offload_write_back_dirty_blocks"] == 0
+
+
+def test_write_back_reused_dirty_entry_is_deduped_across_src_blocks():
+    scheduler, manager, request = _make_write_back_scheduler(
+        block_size_factor=2,
+        block_ids=[11, 12],
+    )
+    scheduler.build_connector_meta(
+        _scheduled_output(request.request_id, request.num_tokens)
+    )
+    dirty_id = next(iter(scheduler._dirty_blocks))
+
+    remove_dirty_block = MagicMock(wraps=scheduler._remove_dirty_block)
+    scheduler._remove_dirty_block = remove_dirty_block
+
+    scheduler._current_batch_allocated_block_ids.update({11, 12})
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+    remove_dirty_block.assert_called_once_with(dirty_id)
+    assert len(meta.store_jobs) == 1
+    assert len(meta.store_jobs_to_flush_before_forward) == 1
+    manager.prepare_store.assert_called_once()
+
+
+def test_write_back_store_job_to_flush_before_forward_capacity_failure_raises():
+    scheduler, manager, request = _make_write_back_scheduler()
+    manager.prepare_store.side_effect = None
+    manager.prepare_store.return_value = None
+    scheduler.build_connector_meta(_scheduled_output(request.request_id, 4))
+
+    scheduler._current_batch_allocated_block_ids.add(11)
+    with pytest.raises(
+        RuntimeError, match="write-back.*store job to flush before forward"
+    ):
+        scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+
+def test_write_back_active_request_flush_job_is_detached():
+    scheduler, manager, request = _make_write_back_scheduler()
+    scheduler.build_connector_meta(_scheduled_output(request.request_id, 4))
+
+    scheduler._current_batch_allocated_block_ids.add(11)
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+    job_id = next(iter(meta.store_jobs_to_flush_before_forward))
+    assert job_id not in scheduler._req_status[request.request_id].transfer_jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    assert job_id not in scheduler._jobs
+    assert job_id not in scheduler._req_status[request.request_id].transfer_jobs
+    manager.complete_store.assert_called_once()
+
+
+def test_write_back_flush_job_does_not_attach_to_reused_request_id():
+    scheduler, manager, request = _make_write_back_scheduler()
+    old_context = scheduler._req_status[request.request_id].req_context
+    old_context.kv_transfer_params = {"request": "old"}
+    scheduler.build_connector_meta(_scheduled_output(request.request_id, 4))
+
+    scheduler._current_batch_allocated_block_ids.add(11)
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    job_id = next(iter(meta.store_jobs_to_flush_before_forward))
+
+    new_request = _FakeRequest(request_id=request.request_id, num_tokens=4)
+    new_request.kv_transfer_params = {"request": "new"}
+    scheduler.on_new_request(new_request)  # type: ignore[arg-type]
+    new_req_status = scheduler._req_status[request.request_id]
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    manager.complete_store.assert_called_once()
+    _, complete_context = manager.complete_store.call_args.args
+    assert complete_context.kv_transfer_params == {"request": "old"}
+    assert not new_req_status.transfer_jobs
+    assert job_id not in scheduler._jobs
 
 
 class TestMaximalPrefixLookup:
