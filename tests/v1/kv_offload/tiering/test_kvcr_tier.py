@@ -396,6 +396,116 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch, backpressure):
     assert kvcr.discard_hint_calls == ["req"]
 
 
+class _HashedReqContext(ReqContext):
+    """A request context whose engine knows the request's block hashes."""
+
+    def __init__(self, hashes: list[int] | None, **kwargs):
+        super().__init__(**kwargs)
+        self._hashes = hashes
+
+    @property
+    def router_block_hashes(self) -> list[int] | None:
+        return self._hashes
+
+
+# Hashes at and above 2**63 must survive exactly.
+_HASHES = [2**63 + 1, 2**64 - 1, 7]
+_REMOTE_KV_SOURCE = {
+    "remote_kv_source": {
+        "kv_request_id": "kv-1",
+        "remote_host": "10.0.0.1",
+        "remote_port": 17771,
+    }
+}
+
+
+def test_kvcr_tier_hint_from_remote_kv_source(monkeypatch):
+    """remote_kv_source names the peer; the request's own hashes fill the hint."""
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    ctx = _HashedReqContext(
+        _HASHES, req_id="req", kv_transfer_params=_REMOTE_KV_SOURCE
+    )
+
+    tier.on_new_request(ctx)
+
+    ((args, kwargs),) = kvcr.submit_hint_calls
+    assert args == ()
+    assert kwargs["request_id"] == "req"
+    hint = kwargs["hints"]
+    assert hint.protocol_version == "0.1"
+    assert hint.message_id == "kv-1"
+    (action,) = hint.actions
+    assert (action.action_id, action.action_type, action.action_version) == (
+        "a1",
+        "kv.fetch",
+        "1.0",
+    )
+    assert action.payload == {
+        "source_control_endpoint": "tcp://10.0.0.1:17771",
+        "block_hashes": _HASHES,
+    }
+
+
+def test_kvcr_tier_remote_kv_source_ipv6(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    params = {"remote_kv_source": {"remote_host": "fd00::1", "remote_port": 17771}}
+    ctx = _HashedReqContext(_HASHES, req_id="req", kv_transfer_params=params)
+
+    tier.on_new_request(ctx)
+
+    ((_, kwargs),) = kvcr.submit_hint_calls
+    assert kwargs["hints"].message_id == "req"
+    payload = kwargs["hints"].actions[0].payload
+    assert payload["source_control_endpoint"] == "tcp://[fd00::1]:17771"
+
+
+def test_kvcr_tier_typed_hint_wins_over_remote_kv_source(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    typed = KvHintsEnvelope(protocol_version="0.1", message_id="typed", actions=[])
+    ctx = _HashedReqContext(
+        _HASHES, req_id="req", kv_hints=typed, kv_transfer_params=_REMOTE_KV_SOURCE
+    )
+
+    tier.on_new_request(ctx)
+
+    assert kvcr.submit_hint_calls == [((), {"request_id": "req", "hints": typed})]
+
+
+@pytest.mark.parametrize(
+    ("hashes", "params"),
+    [
+        (_HASHES, None),
+        (_HASHES, {"other": 1}),
+        (_HASHES, {"remote_kv_source": "10.0.0.1:17771"}),
+        (_HASHES, {"remote_kv_source": {"remote_port": 17771}}),
+        (_HASHES, {"remote_kv_source": {"remote_host": "10.0.0.1"}}),
+        (None, _REMOTE_KV_SOURCE),
+        ([], _REMOTE_KV_SOURCE),
+    ],
+    ids=[
+        "no-params",
+        "no-source",
+        "not-a-dict",
+        "no-host",
+        "no-port",
+        "hashes-unknown",
+        "no-full-block",
+    ],
+)
+def test_kvcr_tier_no_hint_without_remote_kv_source(monkeypatch, hashes, params):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+
+    tier.on_new_request(
+        _HashedReqContext(hashes, req_id="req", kv_transfer_params=params)
+    )
+
+    assert kvcr.submit_hint_calls == []
+
+
 @pytest.mark.parametrize(
     ("computed", "in_flight", "total_tokens", "expected_keys"),
     [

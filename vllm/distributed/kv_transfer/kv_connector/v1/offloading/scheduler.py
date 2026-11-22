@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from itertools import chain
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
@@ -34,7 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import eagle_proof_margin
+from vllm.v1.core.kv_cache_utils import eagle_proof_margin, maybe_convert_block_hash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
@@ -582,6 +582,20 @@ class _VllmReqContext(ReqContext):
     @property
     def num_tokens(self) -> int:
         return self._request_tokens.num_tokens
+
+    @property
+    def router_block_hashes(self) -> list[int] | None:
+        # A finished request's frozen token counts carry no hashes.
+        if self.get_state(_RequestTokens) is not None:
+            return None
+        req_status = self._scheduler._req_status.get(self.req_id)
+        if req_status is None:
+            return None
+        hashes = [maybe_convert_block_hash(h) for h in req_status.req.block_hashes]
+        # Bytes when VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES is off.
+        if not all(isinstance(h, int) for h in hashes):
+            return None
+        return cast(list[int], hashes)
 
 
 def _create_req_context(

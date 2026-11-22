@@ -139,6 +139,12 @@ class ReqContext:
         """Number of prompt and output tokens, excluding speculative tokens."""
         return None
 
+    @property
+    def router_block_hashes(self) -> list[int] | None:
+        """The request's full-block hashes, block 0 first, as the integers
+        KV events publish (``maybe_convert_block_hash``). None when unknown."""
+        return None
+
     def set_state(self, val: Any) -> None:
         self._state[type(val)] = val
 

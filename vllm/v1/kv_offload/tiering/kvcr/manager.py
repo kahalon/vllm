@@ -60,6 +60,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
 )
+from vllm.v1.kv_hints import KvHintAction, KvHintsEnvelope
 from vllm.v1.kv_offload.base import (
     LookupResult,
     Medium,
@@ -241,6 +242,55 @@ class _FrameworkPinAdapter:
         results = self._pin_job_results
         self._pin_job_results = []
         return results
+
+
+def _remote_kv_source_hint(req_context: ReqContext) -> KvHintsEnvelope | None:
+    """Build a KVCR ``kv.fetch`` hint from ``kv_transfer_params.remote_kv_source``.
+
+    The peer's ``remote_host``/``remote_port`` name its KVCR control endpoint,
+    and the hint lists this request's own block hashes, which equal the peer's
+    when both engines hash with the same block size and seed.
+    """
+    params = req_context.kv_transfer_params
+    source = params.get("remote_kv_source") if params else None
+    if not isinstance(source, dict):
+        return None
+    host = source.get("remote_host")
+    port = source.get("remote_port")
+    if not host or not port:
+        return None
+    block_hashes = req_context.router_block_hashes
+    if not block_hashes:
+        return None
+    host = str(host)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    endpoint = f"tcp://{host}:{port}"
+    message_id = str(source.get("kv_request_id") or req_context.req_id)
+    logger.debug(
+        "Request %s: KVCR hint from remote_kv_source: message_id=%s source=%s "
+        "blocks=%d block_hashes=%s",
+        req_context.req_id,
+        message_id,
+        endpoint,
+        len(block_hashes),
+        block_hashes,
+    )
+    return KvHintsEnvelope(
+        protocol_version="0.1",
+        message_id=message_id,
+        actions=[
+            KvHintAction(
+                action_id="a1",
+                action_type="kv.fetch",
+                action_version="1.0",
+                payload={
+                    "source_control_endpoint": endpoint,
+                    "block_hashes": block_hashes,
+                },
+            )
+        ],
+    )
 
 
 class _VllmKeyAdapter:
@@ -624,7 +674,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        if (hint := req_context.kv_hints) is not None:
+        hint = req_context.kv_hints
+        if hint is None:
+            hint = _remote_kv_source_hint(req_context)
+        if hint is not None:
             self._kvcr.submit_hint(
                 request_id=req_context.req_id,
                 hints=hint,

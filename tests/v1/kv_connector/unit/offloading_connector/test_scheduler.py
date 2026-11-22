@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
     _create_req_context,
+    _RequestTokens,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
@@ -380,6 +381,49 @@ def test_create_req_context_preserves_kv_hints():
     )
 
     assert _create_req_context(request, MagicMock()).kv_hints is kv_hints
+
+
+def _scheduler_with_request(block_hashes: list[bytes]) -> tuple[Any, MagicMock]:
+    request = MagicMock(
+        request_id="req",
+        kv_transfer_params=None,
+        kv_hints=None,
+        block_hashes=block_hashes,
+    )
+    scheduler = MagicMock(_req_status={"req": SimpleNamespace(req=request)})
+    return request, scheduler
+
+
+def test_req_context_router_block_hashes():
+    """The KV-event integer of each block hash: its low 64 bits, big-endian."""
+    block_hashes = [
+        b"\x01" * 24 + (2**63 + 1).to_bytes(8, "big"),
+        (2**64 - 1).to_bytes(32, "big"),
+        (7).to_bytes(32, "big"),
+    ]
+    request, scheduler = _scheduler_with_request(block_hashes)
+
+    ctx = _create_req_context(request, scheduler)
+
+    assert ctx.router_block_hashes == [2**63 + 1, 2**64 - 1, 7]
+
+
+def test_req_context_router_block_hashes_unknown(monkeypatch):
+    request, scheduler = _scheduler_with_request([(7).to_bytes(32, "big")])
+    ctx = _create_req_context(request, scheduler)
+
+    # Byte hashes cannot be named in a KV hint.
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "0")
+    assert ctx.router_block_hashes is None
+    monkeypatch.delenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES")
+
+    # A finished request's context carries frozen token counts only.
+    ctx.set_state(_RequestTokens(0, 0, 1, 1))
+    assert ctx.router_block_hashes is None
+
+    # A context for a request the scheduler no longer tracks.
+    other = _create_req_context(request, MagicMock(_req_status={}))
+    assert other.router_block_hashes is None
 
 
 def _reduce_kv_connector_stats(runner):
